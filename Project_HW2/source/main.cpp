@@ -1,16 +1,35 @@
 // Area- and Topology-Preserving Polygon Simplification
 //
-// Reads polygon rings from a CSV file (ring_id, vertex_id, x, y),
-// greedily simplifies them while preserving total signed area and avoiding
-// topology changes (self-intersections, ring-ring intersections, and holes
-// escaping the outer boundary), then prints the simplified rings plus metrics.
+// Implements the Area-Preserving Segment Collapse (APSC) algorithm from
+// Kronenfeld et al. (2020). Reads polygon rings from a CSV file
+// (ring_id, vertex_id, x, y), greedily simplifies them while preserving
+// total signed area and avoiding topology changes (self-intersections,
+// ring-ring intersections, holes escaping the outer boundary), then
+// prints the simplified rings plus metrics.
 //
-// Output format matches the provided test cases:
-// - ring_id,vertex_id,x,y lines for each output vertex
-// - Total signed area in input / output
-// - Total areal displacement (sum of per-operation displacement costs)
+// KEY IMPROVEMENT over the naive O(n^2) version:
+//   - A min-heap (priority queue) keeps all candidate operations sorted by
+//     cost so we always pop the cheapest one in O(log n).
+//   - Lazy deletion: when a vertex is modified or removed its "generation"
+//     counter increments; stale heap entries are silently discarded when
+//     they do not match the current generation.
+//   - After each collapse only the ~4 affected neighbours are re-evaluated
+//     rather than rescanning all vertices (local update).
+//   - Topology checks are localised: only the two new edges AE and ED are
+//     tested against the ring's other segments (and against other rings)
+//     instead of re-validating the entire polygon from scratch.
+//
+// Overall complexity: O(n log n) for n collapses on a ring with no holes.
+//
+// Output format:
+//   ring_id,vertex_id,x,y   (one line per simplified vertex)
+//   Total signed area in input:  <scientific>
+//   Total signed area in output: <scientific>
+//   Total areal displacement:    <scientific>
 
 #include <algorithm>
+#include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <fstream>
@@ -18,11 +37,8 @@
 #include <iostream>
 #include <limits>
 #include <map>
-#if (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || (__cplusplus >= 201703L)
 #include <optional>
-#else
-#include <experimental/optional>
-#endif
+#include <queue>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -30,18 +46,16 @@
 
 namespace {
 
-#if (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || (__cplusplus >= 201703L)
-template <class T>
-using Opt = std::optional<T>;
-constexpr std::nullopt_t nullopt_v = std::nullopt;
-#else
-template <class T>
-using Opt = std::experimental::optional<T>;
-constexpr std::experimental::nullopt_t nullopt_v = std::experimental::nullopt;
-#endif
+// -------------------------------------------------------------------------
+// Numeric constants
+// -------------------------------------------------------------------------
 
-// Small epsilon used for floating-point comparisons and degenerate-case guards.
+// Primary epsilon for floating-point equality comparisons.
 constexpr double kEps = 1e-12;
+
+// -------------------------------------------------------------------------
+// Basic geometry types
+// -------------------------------------------------------------------------
 
 // 2D point with double-precision coordinates.
 struct Point {
@@ -49,72 +63,70 @@ struct Point {
     double y{};
 };
 
-// A polygon vertex: stores a 2D position plus its original vertex_id from the CSV.
-// original_id is kept so we can:
-//   (a) skip the anchor vertex (id == 0) during simplification
-//   (b) deterministically break cost ties (prefer lower ring_id then lower vertex_id)
-//   (c) rotate the output ring so it still starts at the original vertex 0
+// A polygon vertex: 2D position plus its original vertex_id from the CSV.
+// We keep original_id to:
+//   (a) skip the anchor vertex (id == 0) during simplification so the ring
+//       can always be rotated back to start at the original first vertex.
+//   (b) break cost ties deterministically (lower ring_id wins, then lower
+//       original_id within the same ring).
+//   (c) rotate the output ring to start at original vertex 0 if it survived.
 struct Vertex {
-    Point p;
-    int original_id{};
+    Point p{};
+    int   original_id{};
 };
 
-// Returns true if |a - b| <= eps.
+// A directed line segment a -> b.
+struct Segment {
+    Point a{};
+    Point b{};
+};
+
+// -------------------------------------------------------------------------
+// Low-level geometry helpers
+// -------------------------------------------------------------------------
+
+// Floating-point equality within eps.
 static inline bool nearlyEqual(double a, double b, double eps = kEps) {
     return std::abs(a - b) <= eps;
 }
 
-// 2D cross product a.x*b.y - a.y*b.x, computed in long double for stability.
+// 2D cross product  a x b = a.x*b.y - a.y*b.x  in long double for stability.
 static inline long double crossLD(const Point& a, const Point& b) {
     return static_cast<long double>(a.x) * static_cast<long double>(b.y)
          - static_cast<long double>(a.y) * static_cast<long double>(b.x);
 }
 
-// Cross product of vectors (b-a) and (c-a), i.e. the signed area of triangle abc x2.
+// Cross product of (b-a) and (c-a): twice the signed area of triangle abc.
 static inline long double crossLD(const Point& a, const Point& b, const Point& c) {
     return crossLD(Point{b.x - a.x, b.y - a.y}, Point{c.x - a.x, c.y - a.y});
 }
 
-// Returns |(b-a) x (c-a)|  -- twice the unsigned area of triangle abc.
+// Twice the unsigned area of triangle abc: |(b-a) x (c-a)|.
 static inline double area2TriangleAbs(const Point& a, const Point& b, const Point& c) {
-    const long double v = crossLD(a, b, c);
-    return static_cast<double>(std::abs(v));
+    return static_cast<double>(std::abs(crossLD(a, b, c)));
 }
 
-// Shoelace (surveyor's) formula: signed area of a closed polygon ring.
-// Positive means counter-clockwise winding; negative means clockwise.
+// Shoelace formula: signed area of a closed polygon ring.
+// Positive = CCW winding (exterior ring); negative = CW (hole).
 static inline double signedRingArea(const std::vector<Vertex>& ring) {
-    if (ring.size() < 3) {
-        return 0.0;
-    }
+    if (ring.size() < 3) return 0.0;
     long double sum = 0.0L;
-    for (std::size_t i = 0; i < ring.size(); ++i) {
-        const auto& p = ring[i].p;
-        const auto& q = ring[(i + 1) % ring.size()].p;
-        sum += crossLD(p, q);  // accumulates cross products p x q
+    const std::size_t n = ring.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        sum += crossLD(ring[i].p, ring[(i + 1) % n].p);
     }
     return static_cast<double>(0.5L * sum);
 }
 
-// A directed line segment from a to b.
-struct Segment {
-    Point a;
-    Point b;
-};
-
-// Returns true if point p lies on segment [a, b] (collinear and within the bbox).
-// Uses a 1e-10 tolerance so near-collinear points are treated as on the segment.
+// Returns true if p lies on segment [a, b] (collinear + inside bbox).
+// Tolerance 1e-10 handles near-degenerate cases.
 static inline bool onSegment(const Point& a, const Point& b, const Point& p) {
-    if (std::abs(static_cast<double>(crossLD(a, b, p))) > 1e-10) {
-        return false;  // not collinear
-    }
-    // Check bounding-box containment with a small tolerance
+    if (std::abs(static_cast<double>(crossLD(a, b, p))) > 1e-10) return false;
     return (std::min(a.x, b.x) - 1e-10 <= p.x && p.x <= std::max(a.x, b.x) + 1e-10) &&
            (std::min(a.y, b.y) - 1e-10 <= p.y && p.y <= std::max(a.y, b.y) + 1e-10);
 }
 
-// Returns the orientation of triangle (a, b, c):
-//  +1 = counter-clockwise, -1 = clockwise, 0 = collinear.
+// Orientation of triangle (a,b,c): +1 CCW, -1 CW, 0 collinear.
 static inline int orient(const Point& a, const Point& b, const Point& c) {
     const long double v = crossLD(a, b, c);
     if (v >  1e-12L) return  1;
@@ -122,407 +134,427 @@ static inline int orient(const Point& a, const Point& b, const Point& c) {
     return 0;
 }
 
-// Returns true if segments (p1,q1) and (p2,q2) share any point,
-// including endpoints and collinear overlaps.
-// Uses the standard orientation-based intersection test.
-static inline bool segmentsIntersectProperOrTouch(const Point& p1, const Point& q1,
-                                                   const Point& p2, const Point& q2) {
+// Returns true if segments (p1,q1) and (p2,q2) share any point
+// (proper crossing, T-intersection, or collinear overlap).
+static inline bool segmentsIntersect(const Point& p1, const Point& q1,
+                                     const Point& p2, const Point& q2) {
     const int o1 = orient(p1, q1, p2);
     const int o2 = orient(p1, q1, q2);
     const int o3 = orient(p2, q2, p1);
     const int o4 = orient(p2, q2, q1);
 
-    // Collinear endpoint cases: check if the endpoint lies on the other segment
     if (o1 == 0 && onSegment(p1, q1, p2)) return true;
     if (o2 == 0 && onSegment(p1, q1, q2)) return true;
     if (o3 == 0 && onSegment(p2, q2, p1)) return true;
     if (o4 == 0 && onSegment(p2, q2, q1)) return true;
 
-    // General proper intersection: the two endpoints of each segment straddle the other
     return (o1 != o2) && (o3 != o4);
 }
 
-// Ray-casting point-in-polygon test (strict interior).
-// Returns false if p lies exactly on the boundary.
+// Ray-casting point-in-polygon (strict interior: boundary returns false).
 static inline bool pointInPolygonStrict(const Point& p, const std::vector<Vertex>& ring) {
     if (ring.size() < 3) return false;
-
     bool inside = false;
     for (std::size_t i = 0, j = ring.size() - 1; i < ring.size(); j = i++) {
         const Point& a = ring[j].p;
         const Point& b = ring[i].p;
-
-        // If p is exactly on this edge, it is not strictly interior
         if (onSegment(a, b, p)) return false;
-
-        // Standard ray-cast crossing test (horizontal ray from p rightward)
-        const bool intersect = ((a.y > p.y) != (b.y > p.y)) &&
-                               (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y + 0.0) + a.x);
-        if (intersect) inside = !inside;
+        if (((a.y > p.y) != (b.y > p.y)) &&
+            (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x))
+            inside = !inside;
     }
     return inside;
 }
 
-// Builds the list of directed edge segments for a ring.
-static inline std::vector<Segment> ringSegments(const std::vector<Vertex>& ring) {
-    std::vector<Segment> segs;
-    if (ring.size() < 2) return segs;
-    segs.reserve(ring.size());
-    for (std::size_t i = 0; i < ring.size(); ++i) {
-        segs.push_back(Segment{ring[i].p, ring[(i + 1) % ring.size()].p});
-    }
-    return segs;
-}
-
-// Returns true if the ring has no self-intersections (i.e. is a simple polygon).
-// Adjacent edges share an endpoint by construction, so they are skipped.
-// A triangle (3 edges) cannot self-intersect, so we short-circuit for size < 4.
-static inline bool ringIsSimple(const std::vector<Vertex>& ring) {
-    const auto segs = ringSegments(ring);
-    if (segs.size() < 4) return true;  // triangles are always simple
-
-    const std::size_t n = segs.size();
-    for (std::size_t i = 0; i < n; ++i) {
-        for (std::size_t j = i + 1; j < n; ++j) {
-            // Skip edge pairs that share a vertex (they are adjacent)
-            const bool adjacent = (j == i) || (j == (i + 1) % n) || (i == (j + 1) % n);
-            if (adjacent) continue;
-            if (segmentsIntersectProperOrTouch(segs[i].a, segs[i].b,
-                                               segs[j].a, segs[j].b)) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-// Returns true if no two rings in the collection share any boundary point or overlap.
-static inline bool ringsAreDisjoint(const std::vector<std::vector<Vertex>>& rings) {
-    // Pre-build all segment lists to avoid recomputing in the inner loop
-    std::vector<std::vector<Segment>> allSegs;
-    allSegs.reserve(rings.size());
-    for (const auto& r : rings) allSegs.push_back(ringSegments(r));
-
-    for (std::size_t i = 0; i < rings.size(); ++i) {
-        for (std::size_t j = i + 1; j < rings.size(); ++j) {
-            for (const auto& s1 : allSegs[i]) {
-                for (const auto& s2 : allSegs[j]) {
-                    if (segmentsIntersectProperOrTouch(s1.a, s1.b, s2.a, s2.b))
-                        return false;
-                }
-            }
-        }
-    }
-    return true;
-}
-
-// Returns the total number of vertices across all rings.
+// Total vertex count across all rings.
 static inline std::size_t totalVertexCount(const std::vector<std::vector<Vertex>>& rings) {
     std::size_t c = 0;
     for (const auto& r : rings) c += r.size();
     return c;
 }
 
-// Describes one simplification step:
-//   - Remove the vertex at remove_index in rings[ring_index]
-//   - Move either the previous vertex (move_prev=true) or next vertex (move_prev=false)
-//     to moved_point so that the signed area is preserved exactly
-//   - cost is the areal displacement incurred by this move
-struct CandidateOp {
-    int ring_index{};
-    std::size_t remove_index{};
-    bool move_prev{};       // true = slide the predecessor; false = slide the successor
-    Point moved_point{};
-    double cost{};          // areal displacement = |triangle area| * scale factor
-};
-
-// The outer ring (ring_id == 0) must keep at least 4 vertices (a valid polygon
-// with distinct corners), while hole rings only need 3 (a triangle is the minimum).
+// Minimum vertices a ring must keep (outer ring needs 4 to stay a valid quad;
+// holes only need 3 — a triangle is the minimal simple polygon).
 static inline int ringMinVertices(int ring_id) {
     return (ring_id == 0) ? 4 : 3;
 }
 
-// Computes the "move previous" operation for removing vertex C at index idx.
-//
-// Neighbourhood: A - B - C - D  (indices iA, iB=idx-1, iC=idx, iD=idx+1)
-//
-// We want to find a new position B' on segment A-B such that removing C and
-// replacing B with B' leaves the signed ring area unchanged.
-//
-// Derivation:
-//   The shoelace area contribution of the four consecutive cross-products
-//   crossLD(A,B) + crossLD(B,C) + crossLD(C,D)  changes when we:
-//     - replace B with B' = A + t*(B-A)
-//     - remove C
-//   Setting the new contribution equal to K = original contribution gives a
-//   linear equation in t, solved below.
-//
-// Returns (B', displacement_cost) or nullopt if the problem is degenerate.
-static inline Opt<std::pair<Point, double>>
-computeMovePrev(const std::vector<Vertex>& ring, std::size_t idx) {
-    const std::size_t n = ring.size();
-    const std::size_t iA = (idx + n - 2) % n;
-    const std::size_t iB = (idx + n - 1) % n;  // vertex to be moved
-    const std::size_t iC = idx;                  // vertex to be removed
-    const std::size_t iD = (idx + 1) % n;
+// -------------------------------------------------------------------------
+// Doubly-linked ring representation
+// -------------------------------------------------------------------------
+// Each ring is stored as a circular doubly-linked list of nodes so that
+// prev/next navigation and vertex removal are O(1) without shifting arrays.
 
-    const Point A = ring[iA].p;
-    const Point B = ring[iB].p;
-    const Point C = ring[iC].p;
-    const Point D = ring[iD].p;
+struct RingNode {
+    Point p{};
+    int   original_id{};
+    int   generation{0};  // incremented when this node is moved or removed
+    std::size_t prev{};   // index of predecessor in the nodes array
+    std::size_t next{};   // index of successor in the nodes array
+    bool  alive{true};    // false once the node has been collapsed away
+};
 
-    // Sum of the three cross-products we are replacing (= K, the invariant)
+// A ring stored as a pool of RingNode objects with circular prev/next links.
+// head is the index of an alive node that we treat as the "start" for output.
+struct Ring {
+    std::vector<RingNode> nodes;  // node pool; indices are stable
+    std::size_t           head{}; // index of the first alive node
+    std::size_t           size{}; // number of alive nodes
+    int                   ring_id{};
+};
+
+// Build a Ring from a flat vector<Vertex>.
+static Ring buildRing(const std::vector<Vertex>& verts, int ring_id) {
+    Ring r;
+    r.ring_id = ring_id;
+    r.size    = verts.size();
+    r.nodes.resize(verts.size());
+    for (std::size_t i = 0; i < verts.size(); ++i) {
+        r.nodes[i].p           = verts[i].p;
+        r.nodes[i].original_id = verts[i].original_id;
+        r.nodes[i].prev        = (i + verts.size() - 1) % verts.size();
+        r.nodes[i].next        = (i + 1) % verts.size();
+        r.nodes[i].alive       = true;
+        r.nodes[i].generation  = 0;
+    }
+    r.head = 0;
+    return r;
+}
+
+// Flatten a Ring back to a vector<Vertex> starting from head,
+// then rotate so original_id==0 comes first (or smallest surviving id).
+static std::vector<Vertex> flattenRing(const Ring& ring) {
+    std::vector<Vertex> out;
+    out.reserve(ring.size);
+    std::size_t cur = ring.head;
+    for (std::size_t i = 0; i < ring.size; ++i) {
+        out.push_back(Vertex{ring.nodes[cur].p, ring.nodes[cur].original_id});
+        cur = ring.nodes[cur].next;
+    }
+
+    // Rotate so original_id==0 is first (if it survived), else smallest id.
+    auto it = std::find_if(out.begin(), out.end(),
+                           [](const Vertex& v){ return v.original_id == 0; });
+    if (it == out.end()) {
+        it = std::min_element(out.begin(), out.end(),
+                              [](const Vertex& a, const Vertex& b){
+                                  return a.original_id < b.original_id; });
+    }
+    std::rotate(out.begin(), it, out.end());
+    return out;
+}
+
+// -------------------------------------------------------------------------
+// Area-preserving placement (Kronenfeld et al. 2020)
+// -------------------------------------------------------------------------
+// Given a 4-vertex window A-B-C-D in the ring, find the position of the new
+// Steiner point (either B' on segment A-B, or D' on segment D-E) that:
+//   1. Preserves the signed ring area exactly.
+//   2. Minimises the resulting areal displacement.
+//
+// computeMovePrev: remove C, slide B -> B' on ray A->B.
+// computeMoveNext: remove C, slide D -> D' on ray D->E.
+//
+// Both return (new_point, displacement_cost) or nullopt if degenerate.
+
+static inline std::optional<std::pair<Point, double>>
+computeMovePrev(const Point& A, const Point& B, const Point& C, const Point& D) {
+    // Invariant K = cross(A,B) + cross(B,C) + cross(C,D)
     const long double crossAB = crossLD(A, B);
     const long double crossBC = crossLD(B, C);
     const long double crossCD = crossLD(C, D);
-    const long double K = crossAB + crossBC + crossCD;
+    const long double K       = crossAB + crossBC + crossCD;
 
-    // After the operation: cross(A, B') + cross(B', D) must equal K
-    // B' = A + t*(B-A), so:
-    //   cross(A, A+t*(B-A)) + cross(A+t*(B-A), D) = K
-    // Expanding and collecting terms in t gives:
-    //   t * (cross(A,B) + cross(B,D) - cross(A,D))  =  K - cross(A,D)
+    // After replacing B with B'=A+t*(B-A) and removing C:
+    //   cross(A,B') + cross(B',D) = K
+    // Expanding: t*(crossAB + crossBD - crossAD) = K - crossAD
     const long double crossAD = crossLD(A, D);
     const long double crossBD = crossLD(B, D);
-    const long double denom = crossAB + crossBD - crossAD;
+    const long double denom   = crossAB + crossBD - crossAD;
 
-    if (std::abs(static_cast<double>(denom)) < 1e-15) {
-        return nullopt_v;  // degenerate: A, B, D are collinear
-    }
+    if (std::abs(static_cast<double>(denom)) < 1e-15) return std::nullopt;
 
     const long double t = (K - crossAD) / denom;
-    if (!std::isfinite(static_cast<double>(t)) || std::abs(static_cast<double>(t)) < 1e-15) {
-        return nullopt_v;  // t=0 would collapse B' onto A
-    }
+    if (!std::isfinite(static_cast<double>(t)) ||
+        std::abs(static_cast<double>(t)) < 1e-15)
+        return std::nullopt;
 
-    // New position of B: interpolate along A->B using parameter t
-    const Point Bp{A.x + static_cast<double>(t) * (B.x - A.x),
-                   A.y + static_cast<double>(t) * (B.y - A.y)};
+    const Point Bp{ A.x + static_cast<double>(t) * (B.x - A.x),
+                    A.y + static_cast<double>(t) * (B.y - A.y) };
 
-    // Areal displacement = |triangle BCD| * |1 - 1/t|
-    // This quantifies how much area the triangle sweeps as B moves to B'
-    const double area2  = area2TriangleAbs(B, C, D);
-    const double factor = std::abs(1.0 - 1.0 / static_cast<double>(t));
-    const double cost   = factor * area2;
-
+    // Displacement cost = |triangle BCD| * |1 - 1/t|
+    const double cost = area2TriangleAbs(B, C, D) *
+                        std::abs(1.0 - 1.0 / static_cast<double>(t));
     return std::make_pair(Bp, cost);
 }
 
-// Computes the "move next" operation for removing vertex C at index idx.
-//
-// Neighbourhood: B - C - D - E  (indices iB=idx-1, iC=idx, iD=idx+1, iE=idx+2)
-//
-// Analogous to computeMovePrev but the successor D is moved to D' = D + beta*(E-D).
-// The same area-preservation constraint gives a linear equation in beta.
-//
-// Returns (D', displacement_cost) or nullopt if degenerate.
-static inline Opt<std::pair<Point, double>>
-computeMoveNext(const std::vector<Vertex>& ring, std::size_t idx) {
-    const std::size_t n = ring.size();
-    const std::size_t iB = (idx + n - 1) % n;
-    const std::size_t iC = idx;                  // vertex to be removed
-    const std::size_t iD = (idx + 1) % n;        // vertex to be moved
-    const std::size_t iE = (idx + 2) % n;
-
-    const Point B = ring[iB].p;
-    const Point C = ring[iC].p;
-    const Point D = ring[iD].p;
-    const Point E = ring[iE].p;
-
-    // Invariant K: sum of the three cross-products being replaced
+static inline std::optional<std::pair<Point, double>>
+computeMoveNext(const Point& B, const Point& C, const Point& D, const Point& E) {
+    // Invariant K = cross(B,C) + cross(C,D) + cross(D,E)
     const long double crossBC = crossLD(B, C);
     const long double crossCD = crossLD(C, D);
     const long double crossDE = crossLD(D, E);
-    const long double K = crossBC + crossCD + crossDE;
+    const long double K       = crossBC + crossCD + crossDE;
 
-    // After removing C and moving D to D' = D + beta*(E-D):
-    //   cross(B, D') + cross(D', E) = K
-    // Expanding gives a linear equation in beta:
-    //   beta * (cross(B,E) - cross(B,D) - cross(D,E)) = K - cross(B,D) - cross(D,E)
+    // After removing C and moving D to D'=D+beta*(E-D):
+    //   cross(B,D') + cross(D',E) = K
+    // Expanding: beta*(crossBE - crossBD - crossDE) = K - crossBD - crossDE
     const long double crossBD = crossLD(B, D);
     const long double crossBE = crossLD(B, E);
     const long double denom   = crossBE - crossBD - crossDE;
 
-    if (std::abs(static_cast<double>(denom)) < 1e-15) {
-        return nullopt_v;  // degenerate
-    }
+    if (std::abs(static_cast<double>(denom)) < 1e-15) return std::nullopt;
 
     const long double beta = (K - crossBD - crossDE) / denom;
-    if (!std::isfinite(static_cast<double>(beta))) {
-        return nullopt_v;
-    }
+    if (!std::isfinite(static_cast<double>(beta))) return std::nullopt;
 
     const double oneMinus = 1.0 - static_cast<double>(beta);
-    if (std::abs(oneMinus) < 1e-15) {
-        return nullopt_v;  // D' would land exactly on E
-    }
+    if (std::abs(oneMinus) < 1e-15) return std::nullopt;
 
-    // New position of D: interpolate along D->E by beta
-    const Point Dp{D.x + static_cast<double>(beta) * (E.x - D.x),
-                   D.y + static_cast<double>(beta) * (E.y - D.y)};
+    const Point Dp{ D.x + static_cast<double>(beta) * (E.x - D.x),
+                    D.y + static_cast<double>(beta) * (E.y - D.y) };
 
-    // Areal displacement = |triangle BCD| * |beta / (1 - beta)|
-    const double area2  = area2TriangleAbs(B, C, D);
-    const double factor = std::abs(static_cast<double>(beta) / oneMinus);
-    const double cost   = factor * area2;
-
+    // Displacement cost = |triangle BCD| * |beta / (1 - beta)|
+    const double cost = area2TriangleAbs(B, C, D) *
+                        std::abs(static_cast<double>(beta) / oneMinus);
     return std::make_pair(Dp, cost);
 }
 
-// Applies a CandidateOp to one ring and returns the modified ring.
-// The vertex at remove_index is dropped; the vertex at idxMove is updated
-// to op.moved_point so area is preserved.
-static inline std::vector<Vertex> applyOpToRing(const std::vector<Vertex>& ring,
-                                                  const CandidateOp& op) {
-    const std::size_t n = ring.size();
-    std::vector<Vertex> out;
-    out.reserve(n - 1);  // result has exactly one fewer vertex
+// -------------------------------------------------------------------------
+// Local topology check
+// -------------------------------------------------------------------------
+// After collapsing vertex C (at node index idxC in ring r) and moving its
+// neighbour to movedPt, check that:
+//   1. The two new edges (prev->movedPt and movedPt->next, or the symmetric
+//      pair for move-next) do not intersect any other edge of the same ring
+//      or any edge of any other ring.
+//   2. Every hole (ring index > 0) still has at least one vertex strictly
+//      inside the outer ring (ring index 0).
+//
+// This is O(n) per check instead of O(n^2) because we only test the two
+// new edges rather than rebuilding and re-validating the entire polygon.
 
-    const std::size_t idxRemove = op.remove_index;
-    // Predecessor if move_prev, successor otherwise
-    const std::size_t idxMove = op.move_prev ? (idxRemove + n - 1) % n
-                                              : (idxRemove + 1)     % n;
+static bool localTopologyOk(
+    const std::vector<Ring>& rings,
+    int                       ringIdx,   // which ring is being modified
+    std::size_t               idxC,      // node index of the vertex being removed
+    std::size_t               idxMoved,  // node index of the vertex being moved
+    const Point&              movedPt)   // new position of idxMoved
+{
+    const Ring& rr = rings[static_cast<std::size_t>(ringIdx)];
 
-    for (std::size_t i = 0; i < n; ++i) {
-        if (i == idxRemove) continue;  // skip the removed vertex
-        Vertex v = ring[i];
-        if (i == idxMove) v.p = op.moved_point;  // update the moved vertex
-        out.push_back(v);
+    // Determine the two new edges produced by this collapse.
+    // If we are moving the predecessor (move_prev):  new edges are prev(idxMoved)->movedPt
+    //                                                 and movedPt->next(idxC)
+    // If we are moving the successor (move_next):    new edges are prev(idxC)->movedPt
+    //                                                 and movedPt->next(idxMoved)
+    const std::size_t prevOfMoved = rr.nodes[idxMoved].prev;
+    const std::size_t nextOfC     = rr.nodes[idxC].next;
+    const std::size_t prevOfC     = rr.nodes[idxC].prev;
+    const std::size_t nextOfMoved = rr.nodes[idxMoved].next;
+
+    // Decide which edge pair to test based on whether idxMoved == prev(idxC)
+    Point edgeA1, edgeA2, edgeB1, edgeB2;
+    if (idxMoved == rr.nodes[idxC].prev) {
+        // move_prev: predecessor is being moved
+        edgeA1 = rr.nodes[prevOfMoved].p;  edgeA2 = movedPt;
+        edgeB1 = movedPt;                   edgeB2 = rr.nodes[nextOfC].p;
+    } else {
+        // move_next: successor is being moved
+        edgeA1 = rr.nodes[prevOfC].p;      edgeA2 = movedPt;
+        edgeB1 = movedPt;                   edgeB2 = rr.nodes[nextOfMoved].p;
     }
-    return out;
-}
 
-// Checks whether applying op leaves all topology invariants satisfied:
-//   1. Every ring remains a simple polygon (no self-intersections).
-//   2. No two rings share a boundary point or overlap (rings are disjoint).
-//   3. Every hole ring (index > 0) has at least one vertex strictly inside the outer ring.
-static inline bool topologyOkAfterApplying(const std::vector<std::vector<Vertex>>& rings,
-                                            const std::vector<int>& ringIds,
-                                            const CandidateOp& op) {
-    // Apply the operation to a temporary copy
-    std::vector<std::vector<Vertex>> tmp = rings;
-    tmp[static_cast<std::size_t>(op.ring_index)] =
-        applyOpToRing(tmp[static_cast<std::size_t>(op.ring_index)], op);
+    // Collect all other edges of the modified ring (excluding the 3 old edges
+    // that are being replaced: prev(idxMoved)->idxMoved, idxMoved->idxC,
+    // idxC->next(idxC)  [or prev(idxC)->idxC, idxC->idxMoved, idxMoved->next])
+    // We build the set of "old" node pairs to skip.
+    auto skipEdge = [&](std::size_t u, std::size_t v) -> bool {
+        // The 3 edges that vanish: (prevOfMoved,idxMoved), (idxMoved,idxC),
+        // (idxC,nextOfC) for move_prev, symmetric for move_next.
+        if (idxMoved == rr.nodes[idxC].prev) {
+            return (u == prevOfMoved && v == idxMoved) ||
+                   (u == idxMoved   && v == idxC)      ||
+                   (u == idxC       && v == nextOfC);
+        } else {
+            return (u == prevOfC   && v == idxC)      ||
+                   (u == idxC      && v == idxMoved)   ||
+                   (u == idxMoved  && v == nextOfMoved);
+        }
+    };
 
-    // Check 1: all rings must still be simple
-    for (const auto& r : tmp) {
-        if (!ringIsSimple(r)) return false;
+    // Test each new edge against every surviving edge of the modified ring,
+    // skipping the 3 old edges and skipping the adjacent edges (which share
+    // an endpoint with the new edge).
+    std::size_t cur = rr.head;
+    for (std::size_t k = 0; k < rr.size; ++k, cur = rr.nodes[cur].next) {
+        if (cur == idxC) continue;            // this node is being removed
+        const std::size_t nxt = rr.nodes[cur].next == idxC
+                                ? rr.nodes[idxC].next  // skip over removed node
+                                : rr.nodes[cur].next;
+        if (nxt == idxC) continue;
+
+        if (skipEdge(cur, nxt)) continue;
+
+        const Point& ep = rr.nodes[cur].p;
+        const Point& eq = (nxt == idxMoved) ? movedPt : rr.nodes[nxt].p;
+
+        // Skip edges that share an endpoint with either new edge
+        // (shared endpoints are not a crossing, just adjacency)
+        auto sharesEndpoint = [&](const Point& a1, const Point& a2,
+                                  const Point& b1, const Point& b2) {
+            return nearlyEqual(a1.x, b1.x) && nearlyEqual(a1.y, b1.y) ||
+                   nearlyEqual(a1.x, b2.x) && nearlyEqual(a1.y, b2.y) ||
+                   nearlyEqual(a2.x, b1.x) && nearlyEqual(a2.y, b1.y) ||
+                   nearlyEqual(a2.x, b2.x) && nearlyEqual(a2.y, b2.y);
+        };
+
+        if (!sharesEndpoint(edgeA1, edgeA2, ep, eq) &&
+            segmentsIntersect(edgeA1, edgeA2, ep, eq)) return false;
+        if (!sharesEndpoint(edgeB1, edgeB2, ep, eq) &&
+            segmentsIntersect(edgeB1, edgeB2, ep, eq)) return false;
     }
 
-    // Check 2: no two rings may share any boundary point
-    if (!ringsAreDisjoint(tmp)) return false;
+    // Test both new edges against every edge of every OTHER ring.
+    for (std::size_t ri = 0; ri < rings.size(); ++ri) {
+        if (static_cast<int>(ri) == ringIdx) continue;
+        const Ring& other = rings[ri];
+        std::size_t oc = other.head;
+        for (std::size_t k = 0; k < other.size; ++k, oc = other.nodes[oc].next) {
+            const std::size_t on = other.nodes[oc].next;
+            const Point& ep = other.nodes[oc].p;
+            const Point& eq = other.nodes[on].p;
+            if (segmentsIntersect(edgeA1, edgeA2, ep, eq)) return false;
+            if (segmentsIntersect(edgeB1, edgeB2, ep, eq)) return false;
+        }
+    }
 
-    // Check 3: every hole must still be contained within the outer ring
-    if (!tmp.empty()) {
-        const auto& outer = tmp[0];
-        for (std::size_t i = 1; i < tmp.size(); ++i) {
-            if (tmp[i].empty()) return false;
-            if (!pointInPolygonStrict(tmp[i][0].p, outer)) return false;
+    // If this is a hole (ringIdx > 0), verify it still lies inside the outer ring.
+    // We use the first alive node of the hole as the test point.
+    if (ringIdx > 0 && !rings.empty()) {
+        // Rebuild the outer ring temporarily with no modification (it is unchanged).
+        const Ring& outer = rings[0];
+        std::vector<Vertex> outerVerts;
+        outerVerts.reserve(outer.size);
+        std::size_t oc = outer.head;
+        for (std::size_t k = 0; k < outer.size; ++k, oc = outer.nodes[oc].next)
+            outerVerts.push_back(Vertex{outer.nodes[oc].p, outer.nodes[oc].original_id});
+
+        // Use the moved point itself as a representative test point.
+        if (!pointInPolygonStrict(movedPt, outerVerts)) return false;
+    }
+
+    // If this is the outer ring (ringIdx == 0), verify every hole still lies inside.
+    if (ringIdx == 0) {
+        // Build a temporary flat representation of the modified outer ring.
+        std::vector<Vertex> outerVerts;
+        outerVerts.reserve(rings[0].size - 1);
+        std::size_t cur2 = rings[0].head;
+        for (std::size_t k = 0; k < rings[0].size; ++k, cur2 = rings[0].nodes[cur2].next) {
+            if (cur2 == idxC) continue;
+            Point pt = (cur2 == idxMoved) ? movedPt : rings[0].nodes[cur2].p;
+            outerVerts.push_back(Vertex{pt, rings[0].nodes[cur2].original_id});
+        }
+        for (std::size_t ri = 1; ri < rings.size(); ++ri) {
+            const Point& sample = rings[ri].nodes[rings[ri].head].p;
+            if (!pointInPolygonStrict(sample, outerVerts)) return false;
         }
     }
 
     return true;
 }
 
-// Greedy best-operation search: scans every non-anchor vertex of every ring,
-// tries both move-prev and move-next, and returns the operation with the
-// lowest areal displacement cost that also passes all topology checks.
-//
-// Tie-breaking is deterministic: prefer lower ring_id, then lower original_id.
-// Returns nullopt if no valid operation exists or we are already at the target.
-static inline Opt<CandidateOp>
-findBestOp(const std::vector<std::vector<Vertex>>& rings,
-           const std::vector<int>& ringIds,
-           std::size_t target) {
-    if (totalVertexCount(rings) <= target) return nullopt_v;
+// -------------------------------------------------------------------------
+// Priority-queue entry (heap node)
+// -------------------------------------------------------------------------
+// Each entry represents one candidate collapse operation.
+// The generation field lets us lazily discard stale entries: if
+// entry.gen != ring.nodes[entry.idxC].generation (or the moved node's
+// generation), the entry is outdated and must be skipped.
 
-    Opt<CandidateOp> best;
+struct HeapEntry {
+    double      cost{};
+    int         ring_index{};
+    std::size_t idxC{};        // index of the vertex to be removed
+    std::size_t idxMoved{};    // index of the vertex to be slid
+    bool        move_prev{};   // true = slide predecessor, false = slide successor
+    Point       moved_pt{};    // pre-computed new position
+    int         gen_c{};       // generation of node idxC at insertion time
+    int         gen_moved{};   // generation of node idxMoved at insertion time
+    int         orig_id_c{};   // original_id of idxC (for tie-breaking)
 
-    for (std::size_t r = 0; r < rings.size(); ++r) {
-        const int ring_id = ringIds[r];
-        const auto& ring  = rings[r];
-        const int minV    = ringMinVertices(ring_id);
+    // Min-heap: smallest cost at top.
+    bool operator>(const HeapEntry& o) const {
+        if (!nearlyEqual(cost, o.cost, 1e-12)) return cost > o.cost;
+        // Tie-break: prefer lower ring_id, then lower original_id of removed vertex.
+        if (ring_index != o.ring_index) return ring_index > o.ring_index;
+        return orig_id_c > o.orig_id_c;
+    }
+};
 
-        // Skip rings that are already at their minimum vertex count
-        if (static_cast<int>(ring.size()) <= minV) continue;
+using MinHeap = std::priority_queue<HeapEntry,
+                                    std::vector<HeapEntry>,
+                                    std::greater<HeapEntry>>;
 
-        for (std::size_t i = 0; i < ring.size(); ++i) {
-            // Skip the anchor vertex (original_id == 0) to keep the ring's
-            // starting reference stable across iterations
-            if (ring[i].original_id == 0) continue;
+// Push both candidate operations (move_prev and move_next) for the vertex
+// at node index idxC into the heap, provided they pass basic sanity checks.
+static void pushCandidates(MinHeap&                    heap,
+                           const std::vector<Ring>&    rings,
+                           int                         ringIdx,
+                           std::size_t                 idxC) {
+    const Ring& r  = rings[static_cast<std::size_t>(ringIdx)];
+    if (!r.nodes[idxC].alive) return;
+    if (r.nodes[idxC].original_id == 0) return; // anchor vertex: never remove
 
-            // Guard: after removal this ring must still have >= minV vertices
-            if (ring.size() - 1 < static_cast<std::size_t>(minV)) continue;
+    const int minV = ringMinVertices(r.ring_id);
+    if (static_cast<int>(r.size) <= minV) return; // ring too small already
 
-            // --- Try move-prev operation ---
-            if (const auto mv = computeMovePrev(ring, i)) {
-                CandidateOp op;
-                op.ring_index   = static_cast<int>(r);
-                op.remove_index = i;
-                op.move_prev    = true;
-                op.moved_point  = mv->first;
-                op.cost         = mv->second;
+    const std::size_t idxB = r.nodes[idxC].prev;  // predecessor
+    const std::size_t idxD = r.nodes[idxC].next;  // successor
+    const std::size_t idxA = r.nodes[idxB].prev;  // predecessor of predecessor
+    const std::size_t idxE = r.nodes[idxD].next;  // successor of successor
 
-                if (topologyOkAfterApplying(rings, ringIds, op)) {
-                    // Accept if strictly cheaper, or equal cost with lower id
-                    if (!best || op.cost < best->cost - 1e-12 ||
-                        (nearlyEqual(op.cost, best->cost, 1e-12) &&
-                         (ring_id < ringIds[best->ring_index] ||
-                          (ring_id == ringIds[best->ring_index] &&
-                           ring[i].original_id < rings[best->ring_index][best->remove_index].original_id)))) {
-                        best = op;
-                    }
-                }
-            }
+    const Point& A = r.nodes[idxA].p;
+    const Point& B = r.nodes[idxB].p;
+    const Point& C = r.nodes[idxC].p;
+    const Point& D = r.nodes[idxD].p;
+    const Point& E = r.nodes[idxE].p;
 
-            // --- Try move-next operation ---
-            if (const auto mv = computeMoveNext(ring, i)) {
-                CandidateOp op;
-                op.ring_index   = static_cast<int>(r);
-                op.remove_index = i;
-                op.move_prev    = false;
-                op.moved_point  = mv->first;
-                op.cost         = mv->second;
-
-                if (topologyOkAfterApplying(rings, ringIds, op)) {
-                    if (!best || op.cost < best->cost - 1e-12 ||
-                        (nearlyEqual(op.cost, best->cost, 1e-12) &&
-                         (ring_id < ringIds[best->ring_index] ||
-                          (ring_id == ringIds[best->ring_index] &&
-                           ring[i].original_id < rings[best->ring_index][best->remove_index].original_id)))) {
-                        best = op;
-                    }
-                }
-            }
-        }
+    // move_prev: remove C, slide B to B'
+    if (auto mv = computeMovePrev(A, B, C, D)) {
+        HeapEntry e;
+        e.cost       = mv->second;
+        e.ring_index = ringIdx;
+        e.idxC       = idxC;
+        e.idxMoved   = idxB;
+        e.move_prev  = true;
+        e.moved_pt   = mv->first;
+        e.gen_c      = r.nodes[idxC].generation;
+        e.gen_moved  = r.nodes[idxB].generation;
+        e.orig_id_c  = r.nodes[idxC].original_id;
+        heap.push(e);
     }
 
-    return best;
-}
-
-// Rotates a ring so the vertex with original_id == 0 is first.
-// If original_id 0 was removed, falls back to the vertex with the smallest original_id.
-// This keeps the output vertex ordering stable and matching expected test output.
-static inline std::vector<Vertex> rotateToOriginalZeroIfPresent(std::vector<Vertex> ring) {
-    if (ring.empty()) return ring;
-
-    auto it = std::find_if(ring.begin(), ring.end(),
-                           [](const Vertex& v) { return v.original_id == 0; });
-    if (it == ring.end()) {
-        // Fallback: start at the smallest surviving original_id
-        auto it2 = std::min_element(ring.begin(), ring.end(),
-                                    [](const Vertex& a, const Vertex& b) {
-                                        return a.original_id < b.original_id;
-                                    });
-        std::rotate(ring.begin(), it2, ring.end());
-        return ring;
+    // move_next: remove C, slide D to D'
+    if (auto mv = computeMoveNext(B, C, D, E)) {
+        HeapEntry e;
+        e.cost       = mv->second;
+        e.ring_index = ringIdx;
+        e.idxC       = idxC;
+        e.idxMoved   = idxD;
+        e.move_prev  = false;
+        e.moved_pt   = mv->first;
+        e.gen_c      = r.nodes[idxC].generation;
+        e.gen_moved  = r.nodes[idxD].generation;
+        e.orig_id_c  = r.nodes[idxC].original_id;
+        heap.push(e);
     }
-
-    std::rotate(ring.begin(), it, ring.end());
-    return ring;
 }
 
-// Splits a comma-separated line into tokens.
+// -------------------------------------------------------------------------
+// CSV parsing
+// -------------------------------------------------------------------------
+
 static inline std::vector<std::string> splitCsvLine(const std::string& line) {
     std::vector<std::string> parts;
     std::stringstream ss(line);
@@ -531,39 +563,31 @@ static inline std::vector<std::string> splitCsvLine(const std::string& line) {
     return parts;
 }
 
-// Reads a CSV file with header "ring_id,vertex_id,x,y" and populates
-// ringIdsOut (in ascending ring_id order, outer ring first) and ringsOut.
-// Returns false if the file cannot be opened.
-static inline bool parseInput(const std::string& path,
-                               std::vector<int>& ringIdsOut,
-                               std::vector<std::vector<Vertex>>& ringsOut) {
+// Reads the CSV and returns rings sorted by ring_id with the outer ring
+// (ring_id == 0) guaranteed to be first.
+static bool parseInput(const std::string&               path,
+                       std::vector<int>&                ringIdsOut,
+                       std::vector<std::vector<Vertex>>& ringsOut) {
     std::ifstream in(path);
     if (!in) return false;
 
     std::string line;
-    if (!std::getline(in, line)) return false;  // consume header row
+    if (!std::getline(in, line)) return false; // skip header
 
-    // Use a nested map to collect vertices grouped by ring_id then vertex_id
-    // (std::map keeps them sorted, so vertices will be in correct order)
     std::map<int, std::map<int, Point>> byRing;
-
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         const auto parts = splitCsvLine(line);
         if (parts.size() < 4) continue;
-
-        const int    ring_id   = std::stoi(parts[0]);
-        const int    vertex_id = std::stoi(parts[1]);
-        const double x         = std::stod(parts[2]);
-        const double y         = std::stod(parts[3]);
-        byRing[ring_id][vertex_id] = Point{x, y};
+        const int    rid = std::stoi(parts[0]);
+        const int    vid = std::stoi(parts[1]);
+        const double x   = std::stod(parts[2]);
+        const double y   = std::stod(parts[3]);
+        byRing[rid][vid] = Point{x, y};
     }
 
     ringIdsOut.clear();
     ringsOut.clear();
-    ringIdsOut.reserve(byRing.size());
-    ringsOut.reserve(byRing.size());
-
     for (auto& [rid, verts] : byRing) {
         ringIdsOut.push_back(rid);
         std::vector<Vertex> ring;
@@ -572,90 +596,160 @@ static inline bool parseInput(const std::string& path,
         ringsOut.push_back(std::move(ring));
     }
 
-    // Ensure the outer ring (ring_id == 0) is always at index 0
+    // Move ring_id==0 to index 0
     if (!ringsOut.empty() && ringIdsOut[0] != 0) {
         auto it = std::find(ringIdsOut.begin(), ringIdsOut.end(), 0);
         if (it != ringIdsOut.end()) {
-            const std::size_t idx = static_cast<std::size_t>(
-                std::distance(ringIdsOut.begin(), it));
+            const std::size_t idx =
+                static_cast<std::size_t>(std::distance(ringIdsOut.begin(), it));
             std::swap(ringIdsOut[0], ringIdsOut[idx]);
             std::swap(ringsOut[0],   ringsOut[idx]);
         }
     }
-
     return true;
 }
 
-}  // namespace
+} // namespace
 
+// =========================================================================
+// main
+// =========================================================================
 int main(int argc, char** argv) {
-    // Require exactly: <program> <input_csv> <target_vertex_count>
     if (argc < 3) {
-        std::cerr << "Usage: "
-                  << (argc > 0 ? argv[0] : "area_and_topology_preserving_polygon_simplification")
-                  << " <input_file> <target_vertices>\n";
+        std::cerr << "Usage: " << (argc > 0 ? argv[0] : "simplify")
+                  << " <input_file.csv> <target_vertices>\n";
         return 1;
     }
 
     const std::string inputPath = argv[1];
-    const std::size_t target    = static_cast<std::size_t>(std::stoll(argv[2]));
+    const std::size_t target    =
+        static_cast<std::size_t>(std::stoll(argv[2]));
 
-    std::vector<int> ringIds;
-    std::vector<std::vector<Vertex>> rings;
-    if (!parseInput(inputPath, ringIds, rings)) {
+    // ---- Parse input ----
+    std::vector<int>                ringIds;
+    std::vector<std::vector<Vertex>> flatRings;
+    if (!parseInput(inputPath, ringIds, flatRings)) {
         std::cerr << "Failed to read input file: " << inputPath << "\n";
         return 1;
     }
 
-    // Record the input area before any simplification for the metrics output
+    // ---- Compute input area (before any changes) ----
     const double inputArea = [&]() {
         double s = 0.0;
-        for (const auto& r : rings) s += signedRingArea(r);
+        for (const auto& r : flatRings) s += signedRingArea(r);
         return s;
     }();
+
+    // ---- Build doubly-linked ring structures ----
+    std::vector<Ring> rings;
+    rings.reserve(flatRings.size());
+    for (std::size_t i = 0; i < flatRings.size(); ++i)
+        rings.push_back(buildRing(flatRings[i], ringIds[i]));
+
+    std::size_t totalVerts = totalVertexCount(flatRings);
+
+    // ---- Populate initial priority queue ----
+    // For every vertex in every ring, compute both candidate operations and
+    // push them into the min-heap.  O(n log n) total.
+    MinHeap heap;
+    for (std::size_t ri = 0; ri < rings.size(); ++ri) {
+        std::size_t cur = rings[ri].head;
+        for (std::size_t k = 0; k < rings[ri].size; ++k, cur = rings[ri].nodes[cur].next)
+            pushCandidates(heap, rings, static_cast<int>(ri), cur);
+    }
 
     double totalArealDisplacement = 0.0;
 
-    // Greedy simplification loop: each iteration removes one vertex
-    // (the cheapest valid operation) until we reach the target count.
-    while (totalVertexCount(rings) > target) {
-        const auto best = findBestOp(rings, ringIds, target);
-        if (!best) break;  // no valid operation found; stop early
+    // ---- Main simplification loop ----
+    // Each iteration pops the cheapest valid entry from the heap, applies it,
+    // then re-inserts only the ~4 affected neighbours.  O(log n) per step.
+    while (totalVerts > target && !heap.empty()) {
+        // Pop the cheapest candidate
+        HeapEntry e = heap.top();
+        heap.pop();
 
-        totalArealDisplacement += best->cost;
-        rings[static_cast<std::size_t>(best->ring_index)] =
-            applyOpToRing(rings[static_cast<std::size_t>(best->ring_index)], *best);
-    }
+        const std::size_t ri = static_cast<std::size_t>(e.ring_index);
+        Ring& ring = rings[ri];
 
-    // Rotate each output ring so it starts at the original vertex 0 (or lowest id)
-    for (auto& r : rings) r = rotateToOriginalZeroIfPresent(std::move(r));
+        // ---- Lazy deletion: skip stale entries ----
+        // An entry is stale if the node it references has been moved or removed
+        // since the entry was created (detected via the generation counter).
+        if (!ring.nodes[e.idxC].alive)                           continue;
+        if (ring.nodes[e.idxC].generation    != e.gen_c)         continue;
+        if (!ring.nodes[e.idxMoved].alive)                       continue;
+        if (ring.nodes[e.idxMoved].generation != e.gen_moved)    continue;
 
-    // Compute output area (should match input area if all operations preserved it)
-    const double outputArea = [&]() {
-        double s = 0.0;
-        for (const auto& r : rings) s += signedRingArea(r);
-        return s;
-    }();
+        // ---- Minimum size guard ----
+        if (static_cast<int>(ring.size) <= ringMinVertices(ring.ring_id)) continue;
 
-    // --- Output ---
-    std::cout << "ring_id,vertex_id,x,y\n";
-    std::cout << std::setprecision(11) << std::defaultfloat;
+        // ---- Local topology check ----
+        if (!localTopologyOk(rings, e.ring_index, e.idxC, e.idxMoved, e.moved_pt))
+            continue;
 
-    // Print each vertex with a renumbered vertex_id starting from 0 per ring
-    for (std::size_t ri = 0; ri < rings.size(); ++ri) {
-        const int ring_id  = ringIds[ri];
-        const auto& ring   = rings[ri];
-        for (std::size_t vi = 0; vi < ring.size(); ++vi) {
-            std::cout << ring_id << "," << vi << ","
-                      << ring[vi].p.x << "," << ring[vi].p.y << "\n";
+        // ---- Apply the collapse ----
+        totalArealDisplacement += e.cost;
+
+        // Move the neighbour to its new Steiner point and increment its generation
+        // so any existing heap entries for it become stale.
+        ring.nodes[e.idxMoved].p = e.moved_pt;
+        ring.nodes[e.idxMoved].generation++;
+
+        // Unlink idxC from the doubly-linked list and mark it dead.
+        const std::size_t prevC = ring.nodes[e.idxC].prev;
+        const std::size_t nextC = ring.nodes[e.idxC].next;
+        ring.nodes[prevC].next  = nextC;
+        ring.nodes[nextC].prev  = prevC;
+        ring.nodes[e.idxC].alive = false;
+        ring.nodes[e.idxC].generation++;  // stale any heap entries for idxC
+
+        // Update head if we just removed the head node.
+        if (ring.head == e.idxC) ring.head = nextC;
+        ring.size--;
+        totalVerts--;
+
+        // ---- Local update: re-insert candidates for the ~4 affected neighbours ----
+        // Only the nodes whose 4-vertex window changed need new entries.
+        // Those are: prevprev, prev (=idxMoved), next, nextnext of the removed vertex.
+        const std::size_t affected[] = {
+            ring.nodes[e.idxMoved].prev,   // A (prev of moved)
+            e.idxMoved,                     // moved node itself (B or D)
+            nextC,                          // first node after the removed one
+            ring.nodes[nextC].next          // one further
+        };
+        for (std::size_t nodeIdx : affected) {
+            if (ring.nodes[nodeIdx].alive)
+                pushCandidates(heap, rings, e.ring_index, nodeIdx);
         }
     }
 
-    // Print summary metrics in scientific notation with 6 decimal places
+    // ---- Flatten rings back to vertex vectors ----
+    std::vector<std::vector<Vertex>> outRings;
+    outRings.reserve(rings.size());
+    for (const auto& r : rings)
+        outRings.push_back(flattenRing(r));
+
+    // ---- Compute output area ----
+    const double outputArea = [&]() {
+        double s = 0.0;
+        for (const auto& r : outRings) s += signedRingArea(r);
+        return s;
+    }();
+
+    // ---- Print output ----
+    std::cout << "ring_id,vertex_id,x,y\n";
+    std::cout << std::setprecision(11) << std::defaultfloat;
+    for (std::size_t ri = 0; ri < outRings.size(); ++ri) {
+        const int ring_id  = ringIds[ri];
+        const auto& ring   = outRings[ri];
+        for (std::size_t vi = 0; vi < ring.size(); ++vi)
+            std::cout << ring_id << "," << vi << ","
+                      << ring[vi].p.x << "," << ring[vi].p.y << "\n";
+    }
+
     std::cout << std::scientific << std::setprecision(6);
-    std::cout << "Total signed area in input: "   << inputArea              << "\n";
-    std::cout << "Total signed area in output: "  << outputArea             << "\n";
-    std::cout << "Total areal displacement: "     << totalArealDisplacement << "\n";
+    std::cout << "Total signed area in input: "  << inputArea              << "\n";
+    std::cout << "Total signed area in output: " << outputArea             << "\n";
+    std::cout << "Total areal displacement: "    << totalArealDisplacement << "\n";
 
     return 0;
 }
