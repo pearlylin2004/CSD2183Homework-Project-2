@@ -1,0 +1,15 @@
+ring_id,vertex_id,x,y
+0,0,-5,-10
+0,1,15,-10
+0,2,15,10
+0,3,-5,10
+1,0,-2,5
+1,1,5,5
+1,2,5,-5
+2,0,6,-2
+2,1,11,3
+2,2,14,-2
+2,3,12,-8
+Total signed area in input: 3.210000e+02
+Total signed area in output: 3.210000e+02
+Total areal displacement: 1.600000e+00
