@@ -144,9 +144,11 @@ static inline bool pointInPolygonStrict(const Point& p, const std::vector<Point>
     return inside;
 }
 
-// Minimum vertices a ring must keep (a triangle is valid for any ring).
-static inline int ringMinVertices() {
-    return 3;  // a triangle is the minimum valid ring for both exterior and interior
+// Minimum vertices a ring must keep.
+// The outer ring (ring_id == 0) needs at least 4 to remain a valid enclosing polygon.
+// Holes (ring_id > 0) only need 3 (a triangle is the minimum simple polygon).
+static inline int ringMinVertices(int ring_id) {
+    return (ring_id == 0) ? 4 : 3;
 }
 
 // -------------------------------------------------------------------------
@@ -225,8 +227,7 @@ computeMovePrev(const Point& A, const Point& B, const Point& C, const Point& D) 
     if (std::abs(static_cast<double>(denom)) < 1e-15) return std::nullopt;
     const long double t = (K - crossAD) / denom;
     if (!std::isfinite(static_cast<double>(t)) ||
-        std::abs(static_cast<double>(t)) < 1e-15 ||
-        static_cast<double>(t) < 0.0) return std::nullopt;
+        std::abs(static_cast<double>(t)) < 1e-15) return std::nullopt;
 
     const Point Bp{ A.x + static_cast<double>(t) * (B.x - A.x),
                     A.y + static_cast<double>(t) * (B.y - A.y) };
@@ -373,7 +374,18 @@ struct HeapEntry {
     bool operator>(const HeapEntry& o) const {
         if (!nearlyEqual(cost, o.cost, 1e-12)) return cost > o.cost;
         if (ring_index != o.ring_index)        return ring_index > o.ring_index;
-        return orig_id_c > o.orig_id_c;
+        if (orig_id_c != o.orig_id_c)          return orig_id_c > o.orig_id_c;
+
+        // Prefer move_next before move_prev
+        if (move_prev != o.move_prev) {
+            return static_cast<int>(move_prev) < static_cast<int>(o.move_prev);
+        }
+
+        // Prefer smaller Steiner x, then smaller Steiner y
+        if (!nearlyEqual(moved_pt.x, o.moved_pt.x, 1e-12)) return moved_pt.x > o.moved_pt.x;
+        if (!nearlyEqual(moved_pt.y, o.moved_pt.y, 1e-12)) return moved_pt.y > o.moved_pt.y;
+
+        return false;
     }
 };
 
@@ -388,7 +400,11 @@ static void pushCandidates(MinHeap&                 heap,
                            std::size_t              idxC)
 {
     const Ring& r = rings[static_cast<std::size_t>(ringIdx)];
-    if (!r.nodes[idxC].alive)            return;
+    if (!r.nodes[idxC].alive) return;
+    // Never remove the anchor vertex (original_id == 0) to keep output rotation stable
+    if (r.nodes[idxC].original_id == 0) return;
+    // Do not shrink the ring below its minimum vertex count
+    if (static_cast<int>(r.size) <= ringMinVertices(r.ring_id)) return;
 
     const std::size_t idxB = r.nodes[idxC].prev;
     const std::size_t idxD = r.nodes[idxC].next;
@@ -541,8 +557,8 @@ int main(int argc, char** argv) {
     double totalArealDisplacement = 0.0;
 
     // ---- Main greedy loop ----
-    // Each iteration pops the cheapest valid entry and applies it in O(log n).
-    // Only the ~4 affected neighbours are re-pushed (local update).
+// Each iteration pops the cheapest valid entry and applies it in O(log n).
+// Only the ~4 affected neighbours are re-pushed (local update).
     while (totalVerts > target && !heap.empty()) {
         HeapEntry e = heap.top();
         heap.pop();
@@ -554,12 +570,48 @@ int main(int argc, char** argv) {
         // If either node was moved or removed since this entry was created,
         // its generation will not match — discard the entry immediately.
         if (!ring.nodes[e.idxC].alive)                         continue;
-        if (ring.nodes[e.idxC].generation    != e.gen_c)       continue;
+        if (ring.nodes[e.idxC].generation != e.gen_c)       continue;
         if (!ring.nodes[e.idxMoved].alive)                     continue;
         if (ring.nodes[e.idxMoved].generation != e.gen_moved)  continue;
 
         // Minimum size guard.
-        if (static_cast<int>(ring.size) <= ringMinVertices()) continue;
+        if (static_cast<int>(ring.size) <= ringMinVertices(ring.ring_id)) continue;
+
+        // ---- Recompute candidate to reject stale heap entries ----
+        {
+            const std::size_t idxB = ring.nodes[e.idxC].prev;
+            const std::size_t idxD = ring.nodes[e.idxC].next;
+            const std::size_t idxA = ring.nodes[idxB].prev;
+            const std::size_t idxE = ring.nodes[idxD].next;
+
+            const Point& A = ring.nodes[idxA].p;
+            const Point& B = ring.nodes[idxB].p;
+            const Point& C = ring.nodes[e.idxC].p;
+            const Point& D = ring.nodes[idxD].p;
+            const Point& E = ring.nodes[idxE].p;
+
+            Opt<std::pair<Point, double>> cur;
+
+            if (e.move_prev) {
+                if (e.idxMoved != idxB) continue;
+                cur = computeMovePrev(A, B, C, D);
+            }
+            else {
+                if (e.idxMoved != idxD) continue;
+                cur = computeMoveNext(B, C, D, E);
+            }
+
+            if (!cur) continue;
+
+            const Point& p = cur->first;
+            const double c = cur->second;
+
+            if (!nearlyEqual(p.x, e.moved_pt.x, 1e-9) ||
+                !nearlyEqual(p.y, e.moved_pt.y, 1e-9) ||
+                !nearlyEqual(c, e.cost, 1e-9)) {
+                continue; // stale heap entry
+            }
+        }
 
         // ---- Local topology check ----
         // Tests only the 2 new edges instead of rebuilding the full polygon.
@@ -577,9 +629,9 @@ int main(int argc, char** argv) {
         // Unlink idxC from the circular list and mark it dead.
         const std::size_t prevC = ring.nodes[e.idxC].prev;
         const std::size_t nextC = ring.nodes[e.idxC].next;
-        ring.nodes[prevC].next  = nextC;
-        ring.nodes[nextC].prev  = prevC;
-        ring.nodes[e.idxC].alive      = false;
+        ring.nodes[prevC].next = nextC;
+        ring.nodes[nextC].prev = prevC;
+        ring.nodes[e.idxC].alive = false;
         ring.nodes[e.idxC].generation++;  // stale all heap entries for idxC
 
         if (ring.head == e.idxC) ring.head = nextC;
@@ -587,17 +639,18 @@ int main(int argc, char** argv) {
         totalVerts--;
 
         // ---- Local re-enqueue: only the ~4 nodes whose windows changed ----
-        // This is the key improvement over the previous O(n) full-ring re-enqueue.
-        // Only the nodes whose 4-vertex neighbourhood was altered need new entries.
         const std::size_t affected[] = {
-            ring.nodes[e.idxMoved].prev,  // prev of the moved node (window shifted)
-            e.idxMoved,                    // the moved node itself
-            nextC,                          // first node after the removed vertex
-            ring.nodes[nextC].next          // one step further
+            ring.nodes[e.idxMoved].prev,
+            e.idxMoved,
+            nextC,
+            ring.nodes[nextC].next
         };
-        for (std::size_t nodeIdx : affected)
-            if (ring.nodes[nodeIdx].alive)
+
+        for (std::size_t nodeIdx : affected) {
+            if (ring.nodes[nodeIdx].alive) {
                 pushCandidates(heap, rings, e.ring_index, nodeIdx);
+            }
+        }
     }
 
     // ---- Flatten rings and rotate to start at original vertex 0 ----

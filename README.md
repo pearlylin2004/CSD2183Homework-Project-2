@@ -1,7 +1,7 @@
 # CSD2183 Project 2 — Area- and Topology-Preserving Polygon Simplification
 
 ## Team Members
-- Jing Wen
+- Jingwen
 - Qi Ting
 - Le Min
 - Pearly
