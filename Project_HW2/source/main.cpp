@@ -68,11 +68,6 @@ struct Point {
     double y{};
 };
 
-struct Segment {
-    Point a{};
-    Point b{};
-};
-
 // -------------------------------------------------------------------------
 // Low-level geometry helpers
 // -------------------------------------------------------------------------
@@ -149,10 +144,9 @@ static inline bool pointInPolygonStrict(const Point& p, const std::vector<Point>
     return inside;
 }
 
-// Minimum vertices a ring must keep.
-// Outer ring (ring_id==0) needs >= 4; holes need >= 3.
-static inline int ringMinVertices(int ring_id) {
-    return (ring_id == 0) ? 4 : 3;
+// Minimum vertices a ring must keep (a triangle is valid for any ring).
+static inline int ringMinVertices() {
+    return 3;  // a triangle is the minimum valid ring for both exterior and interior
 }
 
 // -------------------------------------------------------------------------
@@ -231,7 +225,8 @@ computeMovePrev(const Point& A, const Point& B, const Point& C, const Point& D) 
     if (std::abs(static_cast<double>(denom)) < 1e-15) return std::nullopt;
     const long double t = (K - crossAD) / denom;
     if (!std::isfinite(static_cast<double>(t)) ||
-        std::abs(static_cast<double>(t)) < 1e-15) return std::nullopt;
+        std::abs(static_cast<double>(t)) < 1e-15 ||
+        static_cast<double>(t) < 0.0) return std::nullopt;
 
     const Point Bp{ A.x + static_cast<double>(t) * (B.x - A.x),
                     A.y + static_cast<double>(t) * (B.y - A.y) };
@@ -328,8 +323,8 @@ static bool localTopologyOk(const std::vector<Ring>& rings,
         for (std::size_t k = 0; k < other.size; ++k, oc = other.nodes[oc].next) {
             const Point& ep = other.nodes[oc].p;
             const Point& eq = other.nodes[other.nodes[oc].next].p;
-            if (segmentsIntersectProperOrTouch(eA1,eA2,ep,eq)) return false;
-            if (segmentsIntersectProperOrTouch(eB1,eB2,ep,eq)) return false;
+            if (!sharesEndpoint(eA1,eA2,ep,eq) && segmentsIntersectProperOrTouch(eA1,eA2,ep,eq)) return false;
+            if (!sharesEndpoint(eB1,eB2,ep,eq) && segmentsIntersectProperOrTouch(eB1,eB2,ep,eq)) return false;
         }
     }
 
@@ -394,8 +389,6 @@ static void pushCandidates(MinHeap&                 heap,
 {
     const Ring& r = rings[static_cast<std::size_t>(ringIdx)];
     if (!r.nodes[idxC].alive)            return;
-    if (r.nodes[idxC].original_id == 0)  return;  // anchor vertex: never remove
-    if (static_cast<int>(r.size) <= ringMinVertices(r.ring_id)) return;
 
     const std::size_t idxB = r.nodes[idxC].prev;
     const std::size_t idxD = r.nodes[idxC].next;
@@ -566,7 +559,7 @@ int main(int argc, char** argv) {
         if (ring.nodes[e.idxMoved].generation != e.gen_moved)  continue;
 
         // Minimum size guard.
-        if (static_cast<int>(ring.size) <= ringMinVertices(ring.ring_id)) continue;
+        if (static_cast<int>(ring.size) <= ringMinVertices()) continue;
 
         // ---- Local topology check ----
         // Tests only the 2 new edges instead of rebuilding the full polygon.
